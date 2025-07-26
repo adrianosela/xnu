@@ -109,6 +109,8 @@ struct utun_pcb {
 #if UTUN_NEXUS
 	// lock to protect utun_pcb_data_move & utun_pcb_drainers
 	decl_lck_mtx_data(, utun_pcb_data_move_lock);
+	// spinlock for fast-path data-move counter updates
+	decl_lck_spin_data(, utun_pcb_data_move_slock);
 	u_int32_t               utun_pcb_data_move; /* number of data moving contexts */
 	u_int32_t               utun_pcb_drainers; /* number of threads waiting to drain */
 	u_int32_t               utun_pcb_data_path_state; /* internal state of interface data path */
@@ -1523,6 +1525,7 @@ utun_free_pcb(struct utun_pcb *pcb, bool locked)
 	pcb->utun_input_chain_count = 0;
 	lck_mtx_destroy(&pcb->utun_input_chain_lock, &utun_lck_grp);
 	lck_mtx_destroy(&pcb->utun_pcb_data_move_lock, &utun_lck_grp);
+	lck_spin_destroy(&pcb->utun_pcb_data_move_slock, &utun_lck_grp);
 #endif // UTUN_NEXUS
 	lck_rw_destroy(&pcb->utun_pcb_lock, &utun_lck_grp);
 	if (!locked) {
@@ -1641,6 +1644,8 @@ utun_ctl_bind(kern_ctl_ref kctlref,
 	pcb->utun_input_chain_count = 0;
 	lck_mtx_init(&pcb->utun_input_chain_lock, &utun_lck_grp, &utun_lck_attr);
 	lck_mtx_init(&pcb->utun_pcb_data_move_lock,
+	    &utun_lck_grp, &utun_lck_attr);
+	lck_spin_init(&pcb->utun_pcb_data_move_slock,
 	    &utun_lck_grp, &utun_lck_attr);
 #endif // UTUN_NEXUS
 
@@ -3671,11 +3676,11 @@ utun_data_move_begin(struct utun_pcb *pcb)
 {
 	bool data_path_ready = false;
 
-	lck_mtx_lock_spin(&pcb->utun_pcb_data_move_lock);
+	lck_spin_lock(&pcb->utun_pcb_data_move_slock);
 	if ((data_path_ready = UTUN_IS_DATA_PATH_READY(pcb))) {
 		pcb->utun_pcb_data_move++;
 	}
-	lck_mtx_unlock(&pcb->utun_pcb_data_move_lock);
+	lck_spin_unlock(&pcb->utun_pcb_data_move_slock);
 
 	return data_path_ready;
 }
@@ -3683,7 +3688,7 @@ utun_data_move_begin(struct utun_pcb *pcb)
 static void
 utun_data_move_end(struct utun_pcb *pcb)
 {
-	lck_mtx_lock_spin(&pcb->utun_pcb_data_move_lock);
+	lck_spin_lock(&pcb->utun_pcb_data_move_slock);
 	VERIFY(pcb->utun_pcb_data_move > 0);
 	/*
 	 * if there's no more thread moving data, wakeup any
@@ -3692,7 +3697,7 @@ utun_data_move_end(struct utun_pcb *pcb)
 	if (--pcb->utun_pcb_data_move == 0 && pcb->utun_pcb_drainers > 0) {
 		wakeup(&(pcb->utun_pcb_data_move));
 	}
-	lck_mtx_unlock(&pcb->utun_pcb_data_move_lock);
+	lck_spin_unlock(&pcb->utun_pcb_data_move_slock);
 }
 
 static void
